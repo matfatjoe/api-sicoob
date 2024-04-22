@@ -4,27 +4,26 @@ namespace Divulgueregional\apisicoob;
 
 use Divulgueregional\ApiSicoob\Exceptions\InternalServerErrorException;
 use Divulgueregional\ApiSicoob\Exceptions\InvalidRequestException;
-use Divulgueregional\ApiSicoob\Exceptions\ServiceUnavailableException;
 use Divulgueregional\ApiSicoob\Exceptions\NotAcceptableException;
 use GuzzleHttp\Client;
 use GuzzleHttp\Exception\ClientException;
 use Exception;
+use Divulgueregional\ApiSicoob\Token;
+use Divulgueregional\ApiSicoob\CertificateTools;
 
 // use GuzzleHttp\Psr7\Message;
 // use JetBrains\PhpStorm\NoReturn;
 
-// use Divulgueregional\apisicoob\Token;
-require_once __DIR__ . '/Token.php';
 
 class BankingSicoob
 {
-    const END_POINT_PRODUCTION = "1";
-    const END_POINT_HOMOLOGATION = "2";
+    const END_POINT_PRODUCTION = 1;
+    const END_POINT_HOMOLOGATION = 2;
 
     const HTTP_EXCEPTION_TYPES = [
         InvalidRequestException::HTTP_STATUS_CODE => InvalidRequestException::class,
         NotAcceptableException::HTTP_STATUS_CODE => NotAcceptableException::class,
-        InternalServerErrorException::HTTP_STATUS_CODE => InternalServerErrorException::class,
+        InternalServerErrorException::HTTP_STATUS_CODE => InternalServerErrorException::class
     ];
 
     private $config;
@@ -34,21 +33,19 @@ class BankingSicoob
     protected $urls;
     protected $uriCobranca;
     protected $uriContaCorrente;
-    protected $clientToken;
     protected $clientCobranca;
     protected $clientContaCorrente;
     protected $optionsRequest = [];
 
     function __construct($config)
     {
-        if ($config['endPoints'] == self::END_POINT_PRODUCTION) {
-            $this->urls = 'https://api.sicoob.com.br/';
-            $this->tokens = new Token($config);
-            $this->retornoToken = $this->tokens->getToken();
-            $this->token = $this->retornoToken['access_token'];
-            $config['token'] = $this->token;
+        if (!key_exists('endPoint', $config)) {
+            $config['endPoint'] = self::END_POINT_PRODUCTION;
         }
-        if ($config['endPoints'] == self::END_POINT_HOMOLOGATION) {
+        if ($config['endPoint'] == self::END_POINT_PRODUCTION) {
+            $this->urls = 'https://api.sicoob.com.br/';
+        }
+        if ($config['endPoint'] == self::END_POINT_HOMOLOGATION) {
             $this->urls = 'https://sandbox.sicoob.com.br/sicoob/sandbox/';
             $this->token = $config['token'];
         }
@@ -68,10 +65,9 @@ class BankingSicoob
                 'Content-Type' => 'application/json',
                 'x-sicoob-clientid' => $config['client_id'],
                 'client_id' => $config['client_id'],
-                'Authorization' => "Bearer {$this->token}",
+                'Authorization' => $this->token,
             ],
             'cert' => $config['certificate'],
-            // 'verify' => false,
             'ssl_key' => $config['certificateKey'],
         ];
         $this->config = $config;
@@ -80,6 +76,13 @@ class BankingSicoob
     private function makeRequest(Client $client, $method, $uri, $options, $errorMessage)
     {
         try {
+            $this->getToken();
+            $authorization = $options['headers']['Authorization'];
+            if ($authorization == "Bearer " || empty($authorization)) {
+                $options['headers']['Authorization']
+                    = $this->optionsRequest['headers']['Authorization'];
+            }
+
             $response = $client->request($method, $uri, $options);
             $statusCode = $response->getStatusCode();
             $result = json_decode($response->getBody()->getContents());
@@ -88,15 +91,19 @@ class BankingSicoob
             $statusCode = $e->getResponse()->getStatusCode();
             $requestParameters = $e->getRequest();
             $bodyContent = json_decode($e->getResponse()->getBody()->getContents());
-            $message = $bodyContent->mensagens[0]->mensagem;
             if (isset(self::HTTP_EXCEPTION_TYPES[$statusCode])) {
                 $exceptionClass = self::HTTP_EXCEPTION_TYPES[$statusCode];
+                $messages = $bodyContent->mensagens;
+                $message = '';
+                foreach ($messages as $value) {
+                    $message .= "{$value->codigo} - {$value->mensagem};";
+                }
                 $exception = new $exceptionClass($message);
+                $exception->setRequestParameters($requestParameters);
+                $exception->setBodyContent($bodyContent);
             } else {
                 $exception = $e;
             }
-            $exception->setRequestParameters($requestParameters);
-            $exception->setBodyContent($bodyContent);
             throw $exception;
         } catch (Exception $e) {
             $response = $e->getMessage();
@@ -536,7 +543,7 @@ class BankingSicoob
 
     public function downloadMovimentacao(array $filters)
     {
-        $uri = "boletos/solicitacoes/movimentacao-download";
+        $uri = "boletos/movimentacao-download";
         $options = $this->optionsRequest;
         $options['query'] = $filters;
         return $this->makeRequest(
@@ -560,5 +567,46 @@ class BankingSicoob
             $options,
             "Falha ao consultar saldo da Conta Corrente"
         );
+    }
+
+    ######################################################
+    ############ UTILITÁRIO ##############################
+    ######################################################
+
+    public function setCertificatePfxContent($certificateContent, $certificatePassword)
+    {
+        $certificateTools = new CertificateTools(
+            $this->config['client_id'],
+            $certificateContent,
+            $certificatePassword
+        );
+        $this->config['certificate'] = $certificateTools->getCertificateFilePath();
+        $this->config['certificateKey'] = $certificateTools->getPrivateKeyFilePath();
+        $this->optionsRequest['cert'] = $certificateTools->getCertificateFilePath();
+        $this->optionsRequest['ssl_key'] = $certificateTools->getPrivateKeyFilePath();
+    }
+
+    private function checkTokenExpirationTime()
+    {
+        $now = new \DateTime();
+        return $now > $this->tokens->getExpirationTime();
+    }
+
+    private function getToken()
+    {
+        if (empty($this->tokens)) {
+            $this->tokens = new Token($this->config);
+        }
+
+        if ($this->config['endPoint'] == self::END_POINT_HOMOLOGATION) {
+            $this->token = $this->config['token'];
+            return;
+        }
+        if ($this->checkTokenExpirationTime()) {
+            $this->retornoToken = $this->tokens->getToken();
+            $this->token = $this->retornoToken['access_token'];
+            $this->config['token'] = $this->token;
+            $this->optionsRequest['headers']['Authorization'] = "Bearer {$this->token}";
+        }
     }
 }
